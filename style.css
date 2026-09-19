@@ -75,3 +75,12 @@
 .mes {
     -webkit-touch-callout: none;
 }
+
+/* 长按进行中：抑制文本选择，从源头阻止 iOS 放大镜/选择手柄与 Android 原生菜单 */
+.mes.ncp-suppress,
+.mes.ncp-suppress * {
+    user-select: none !important;
+    -webkit-user-select: none !important;
+    -webkit-touch-callout: none !important;
+    -webkit-tap-highlight-color: transparent !important;
+}

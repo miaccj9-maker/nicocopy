@@ -1,8 +1,8 @@
 {
     "display_name": "气泡复制面板（长按/右键复制）",
     "author": "nico",
-    "description": "手机端长按、电脑端右键聊天气泡，弹出复制小面板，可复制用户与角色的消息文本。",
-    "version": "1.0.0",
+    "description": "手机端长按、电脑端右键用户聊天气泡，弹出复制小面板。仅对用户消息生效，角色（AI）消息不弹出。",
+    "version": "1.2.0",
     "js": "index.js",
     "css": "style.css"
 }

@@ -1,8 +1,16 @@
 /**
  * nicoCopyPanel —— 聊天气泡复制面板
  * ------------------------------------------------------------
- * 手机端：长按聊天气泡（用户消息 / 角色消息均可）弹出复制小面板
- * 电脑端：右键点击聊天气泡弹出复制小面板
+ * 手机端：长按用户聊天气泡弹出复制小面板
+ * 电脑端：右键用户聊天气泡弹出复制小面板
+ * 仅对用户消息生效，角色（AI）消息不弹出复制面板、不干预原生交互。
+ *
+ * v1.2.0 修复：
+ * - 长按开始时立即抑制文本选择（user-select + touch-callout），
+ *   从源头阻止 iOS 放大镜/选择手柄与 Android 原生菜单覆盖面板；
+ * - 事件全部存储引用，支持重复初始化（ST 禁用/启用扩展、热更新脚本）
+ *   先解绑旧监听再重绑，不再出现"加载了却没反应"；
+ * - 长按触发后面板稳定显示，不受系统补发右键/合成点击干扰。
  *
  * 纯前端实现，不修改 SillyTavern 核心代码；
  * 在扩展管理器中禁用或删除本扩展即可完全移除该功能。
@@ -11,12 +19,8 @@
 (function () {
     'use strict';
 
-    // 防止扩展被重复加载（重复绑定事件 / 复制执行两次）
-    if (window.__nicoCopyPanelLoaded) return;
-    window.__nicoCopyPanelLoaded = true;
-
-    const LONG_PRESS_MS = 500;   // 长按判定时长（毫秒）
-    const MOVE_THRESHOLD = 12;   // 手指移动超过该距离即判定为滚动并取消长按（px）
+    const LONG_PRESS_MS = 500;    // 长按判定时长（毫秒）
+    const MOVE_THRESHOLD = 14;    // 手指移动超过该距离即判定为滚动并取消长按（px，容忍轻微抖动）
     const COPY_COOLDOWN_MS = 800; // 两次复制的最小间隔，防连点/双击/幽灵点击导致重复复制
 
     let panel = null;
@@ -27,8 +31,10 @@
     let touchStartY = 0;
     let touchMes = null;
     let activeMes = null;
+    let activeText = '';
     let lastCopyAt = 0;
     let copying = false;
+    let suppressEl = null; // 当前被抑制选择的 .mes 元素
 
     // 这些区域保持原有交互，不弹复制面板（操作按钮 / 头像 / 选择框 / 滑动条 / 图片 / 链接 / 输入框等）
     const EXCLUDED_SELECTOR = [
@@ -59,6 +65,11 @@
         return target instanceof Element ? target.closest('.mes') : null;
     }
 
+    // 仅用户消息生效：酒馆消息元素 .mes 带 is_user 属性（模板固定渲染 "true"/"false"）
+    function isUserMes(mes) {
+        return !!mes && typeof mes.getAttribute === 'function' && mes.getAttribute('is_user') === 'true';
+    }
+
     function getBubbleText(mes) {
         const textEl = mes.querySelector('.mes_text');
         if (!textEl) return '';
@@ -74,6 +85,22 @@
         const chName = mes.getAttribute('ch_name');
         if (chName) return chName;
         return mes.getAttribute('is_user') === 'true' ? '用户' : '角色';
+    }
+
+    /* ---------- 长按文本选择抑制 ---------- */
+
+    function addSuppress(mes) {
+        if (!mes || mes === suppressEl) return;
+        removeSuppress();
+        suppressEl = mes;
+        mes.classList.add('ncp-suppress');
+    }
+
+    function removeSuppress() {
+        if (suppressEl) {
+            suppressEl.classList.remove('ncp-suppress');
+            suppressEl = null;
+        }
     }
 
     /* ---------- 剪贴板 ---------- */
@@ -123,7 +150,9 @@
             '</button>';
         document.body.appendChild(panel);
 
-        panel.querySelector('.copy-panel-btn').addEventListener('click', async (e) => {
+        const btn = panel.querySelector('.copy-panel-btn');
+        const label = btn.querySelector('.copy-panel-label');
+        btn.addEventListener('click', async (e) => {
             e.stopPropagation();
             if (!activeMes || copying) return;
             const now = Date.now();
@@ -131,11 +160,10 @@
             lastCopyAt = now;
             copying = true;
             try {
-                const text = getBubbleText(activeMes);
+                // 使用 showPanel 时缓存好的文本，避免再次读取 innerText（会触发重排，大消息时卡顿）
+                const text = activeText;
                 if (!text) return;
                 const ok = await copyToClipboard(text);
-                const btn = panel.querySelector('.copy-panel-btn');
-                const label = btn.querySelector('.copy-panel-label');
                 label.textContent = ok ? '已复制' : '复制失败';
                 btn.classList.add('copied');
                 setTimeout(() => {
@@ -179,6 +207,7 @@
         const text = getBubbleText(mes);
         if (!text) return;
         activeMes = mes;
+        activeText = text; // 缓存文本，点击复制时不再重复读取 DOM
         const el = getPanel();
         el.querySelector('.copy-panel-sender').textContent = getSenderName(mes);
         // 重置按钮状态，避免上一次的“已复制/复制失败”残留
@@ -192,25 +221,39 @@
     function hidePanel() {
         if (panel) panel.classList.remove('show');
         activeMes = null;
-    }
-
-    function suppressTextSelection() {
-        const style = document.body.style;
-        const prevUserSelect = style.userSelect;
-        const prevWebkitUserSelect = style.webkitUserSelect;
-        style.userSelect = 'none';
-        style.webkitUserSelect = 'none';
-        setTimeout(() => {
-            style.userSelect = prevUserSelect;
-            style.webkitUserSelect = prevWebkitUserSelect;
-        }, 500);
+        activeText = '';
     }
 
     /* ---------- 事件绑定 ---------- */
 
     function init() {
+        // ===== 重复初始化防护：先解绑旧监听再重绑 =====
+        // ST 禁用/启用扩展或热更新脚本时会再次执行本文件；
+        // 若直接 return 会导致事件永不绑定（表现为"没生效/面板不出现"）。
+        const old = window.__nicoCopyPanelHandlers;
+        if (old) {
+            if (old.contextmenu) document.removeEventListener('contextmenu', old.contextmenu);
+            if (old.touchstart) document.removeEventListener('touchstart', old.touchstart);
+            if (old.touchmove) document.removeEventListener('touchmove', old.touchmove);
+            if (old.touchend) document.removeEventListener('touchend', old.touchend);
+            if (old.touchcancel) document.removeEventListener('touchcancel', old.touchcancel);
+            if (old.pointerdown) document.removeEventListener('pointerdown', old.pointerdown, true);
+            if (old.scroll) document.removeEventListener('scroll', old.scroll, true);
+            if (old.keydown) document.removeEventListener('keydown', old.keydown);
+            if (old.resize) window.removeEventListener('resize', old.resize);
+        }
+        // 清理残留面板与状态
+        document.querySelectorAll('#nicoCopyPanel').forEach((el) => el.remove());
+        panel = null;
+        longPressTimer = null;
+        longPressTriggered = false;
+        suppressContextMenu = false;
+        removeSuppress();
+
         // 电脑端：右键弹出复制面板
-        document.addEventListener('contextmenu', (e) => {
+        const H = {};
+
+        H.contextmenu = (e) => {
             if (e.target instanceof Element && e.target.closest('#nicoCopyPanel')) {
                 e.preventDefault();
                 return;
@@ -222,15 +265,17 @@
                 return;
             }
             const mes = getMes(e.target);
-            if (!mes || isExcluded(e.target)) return;
+            // 仅用户消息弹面板；角色（AI）消息不干预，保留浏览器默认右键菜单
+            if (!mes || !isUserMes(mes) || isExcluded(e.target)) return;
             e.preventDefault();
             showPanel(mes, e.clientX, e.clientY, false);
-        });
+        };
 
         // 手机端：长按弹出复制面板
-        document.addEventListener('touchstart', (e) => {
+        H.touchstart = (e) => {
             const mes = getMes(e.target);
-            if (!mes || isExcluded(e.target)) return;
+            // 仅用户消息长按弹面板；角色（AI）消息保持原生长按行为（滚动/选择），零开销短路
+            if (!mes || !isUserMes(mes) || isExcluded(e.target)) return;
             clearTimeout(longPressTimer);
             longPressTriggered = false;
             const touch = e.touches[0];
@@ -238,18 +283,22 @@
             touchStartX = touch.clientX;
             touchStartY = touch.clientY;
             touchMes = mes;
+            // 长按一开始就抑制文本选择：从源头阻止 iOS 放大镜/选择手柄、
+            // Android 原生文本选择菜单抢占/覆盖我们的复制面板
+            addSuppress(mes);
             longPressTimer = setTimeout(() => {
+                longPressTimer = null;
                 longPressTriggered = true;
                 suppressContextMenu = true;
-                suppressTextSelection();
                 showPanel(touchMes, touchStartX, touchStartY, true);
+                // 长按抬手后系统可能补发右键（Android），在窗口期内吞掉
                 setTimeout(() => { suppressContextMenu = false; }, 1200);
             }, LONG_PRESS_MS);
-        }, { passive: true });
+        };
 
         // 手指移动过大 → 判定为滚动，取消长按
-        document.addEventListener('touchmove', (e) => {
-            if (!longPressTimer) return;
+        H.touchmove = (e) => {
+            if (!longPressTimer) return; // 未开始或已触发，零开销
             const touch = e.touches[0];
             if (!touch) return;
             if (Math.abs(touch.clientX - touchStartX) > MOVE_THRESHOLD ||
@@ -257,43 +306,74 @@
                 clearTimeout(longPressTimer);
                 longPressTimer = null;
                 longPressTriggered = false;
+                removeSuppress();
             }
-        }, { passive: true });
+        };
 
         const cancelLongPress = () => {
             clearTimeout(longPressTimer);
             longPressTimer = null;
+            longPressTriggered = false;
+            // 稍延迟移除抑制，避免抬手瞬间系统弹出原生菜单
+            setTimeout(removeSuppress, 300);
         };
-        document.addEventListener('touchend', cancelLongPress);
-        document.addEventListener('touchcancel', cancelLongPress);
+        H.touchend = cancelLongPress;
+        H.touchcancel = cancelLongPress;
 
         // 点击 / 触摸面板以外区域 → 隐藏
-        document.addEventListener('pointerdown', (e) => {
+        H.pointerdown = (e) => {
             if (!panel || !panel.classList.contains('show')) return;
             if (e.target instanceof Element && e.target.closest('#nicoCopyPanel')) return;
             hidePanel();
-        }, true);
+        };
 
-        // 滚动、窗口大小变化、Esc → 隐藏
-        document.addEventListener('scroll', () => hidePanel(), { capture: true, passive: true });
-        window.addEventListener('resize', () => hidePanel());
-        document.addEventListener('keydown', (e) => {
+        // 滚动、Esc → 隐藏（未显示时零开销短路，滚动不卡顿）
+        H.scroll = () => {
+            if (!panel || !panel.classList.contains('show')) return;
+            hidePanel();
+        };
+        H.keydown = (e) => {
             if (e.key === 'Escape') hidePanel();
-        });
+        };
+        H.resize = () => hidePanel();
+
+        document.addEventListener('contextmenu', H.contextmenu);
+        document.addEventListener('touchstart', H.touchstart, { passive: true });
+        document.addEventListener('touchmove', H.touchmove, { passive: true });
+        document.addEventListener('touchend', H.touchend);
+        document.addEventListener('touchcancel', H.touchcancel);
+        document.addEventListener('pointerdown', H.pointerdown, true);
+        document.addEventListener('scroll', H.scroll, true);
+        document.addEventListener('keydown', H.keydown);
+        window.addEventListener('resize', H.resize);
+
+        // 保存引用，供重复初始化时解绑
+        window.__nicoCopyPanelHandlers = H;
 
         // 消息更新 / 编辑 / 删除 / 滑动 / 切换聊天时隐藏，避免指向已失效的气泡
         try {
             const context = SillyTavern.getContext();
             const { eventTypes, eventSource } = context;
             const events = ['MESSAGE_UPDATED', 'MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED', 'CHAT_CHANGED'];
-            for (const name of events) {
-                if (eventTypes[name]) eventSource.on(eventTypes[name], () => hidePanel());
+            // 先移除旧的事件订阅（重复初始化时）
+            if (window.__nicoCopyPanelStEvents) {
+                for (const name of Object.keys(window.__nicoCopyPanelStEvents)) {
+                    try {
+                        eventSource.removeListener(eventTypes[name], window.__nicoCopyPanelStEvents[name]);
+                    } catch (_) { /* 忽略 */ }
+                }
             }
+            const stEvents = {};
+            for (const name of events) {
+                stEvents[name] = () => hidePanel();
+                if (eventTypes[name]) eventSource.on(eventTypes[name], stEvents[name]);
+            }
+            window.__nicoCopyPanelStEvents = stEvents;
         } catch (_) {
             /* SillyTavern API 不可用时忽略 */
         }
 
-        console.log('[nicoCopyPanel] 已加载：手机端长按 / 电脑端右键聊天气泡即可弹出复制面板。');
+        console.log('[nicoCopyPanel] v1.2.0 已加载：仅用户消息生效——手机端长按 / 电脑端右键用户聊天气泡弹出复制面板。');
     }
 
     if (document.readyState === 'loading') {
